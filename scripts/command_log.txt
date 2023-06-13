@@ -12,33 +12,19 @@ for bm in hscrp_log; do
 done
 for bm in hscrp_log; do qsub post_gwis/run_regem.sh ../data/processed/gwis/${bm}_allComponents_gwis_merged "FISH FISHbin" "VEG LEGUMES FRUIT NUTS WHGRAIN MUFA2SFA REDPRMEAT ALC LEGUMESbin NUTSbin WHGRAINbin" ${bm}_2fish; done
 
-for bm in hscrp_log hba1c glu aisi_log sii_log siri_log; do qsub -t 1-22 run_MD_gwis.sh $bm MD; done
-for bm in hscrp_log hba1c; do cat ../data/processed/meddiet_components.txt | while read exp; do qsub -t 1-22 run_gwis.sh $bm $exp; done; done
+for bm in hscrp_log hba1c; do qsub -t 1-22 run_gwis.sh $bm mds; done
+for bm in hscrp_log hba1c; do cat ../data/processed/meddiet_components.txt; echo "med_score" | while read exp; do qsub -t 1-22 run_gwis.sh $bm $exp; done; done
 
-for bm in hscrp_log hba1c glu aisi_log sii_log siri_log; do qsub postprocess_gwis.sh ../data/processed/gwis/${bm}_MD_gwis; done
-for bm in hscrp_log hba1c; do qsub postprocess_gwis.sh ../data/processed/gwis/${bm}_MDcomponents_gwis; done
+for bm in hscrp_log hba1c glu aisi_log sii_log siri_log; do qsub postprocess_gwis.sh ../data/processed/gwis/${bm}_mds_gwis; done
 for bm in hscrp_log hba1c; do cat ../data/processed/meddiet_components.txt | while read exp; do qsub postprocess_gwis.sh ../data/processed/gwis/${bm}_${exp}_gwis; done; done
 
 rsync -avP uger:"florez_ukb_projects/gene-med-interactions/data/processed/gwis/*merged_*" ../data/processed/gwis/
 rsync -ravP uger:florez_ukb_projects/gene-med-interactions/data/processed/gwis/qq_plots ../data/processed/gwis/
-#rsync -avP uger:"florez_ukb_projects/gene-med-interactions/data/processed/gwis/*fumaInput.tsv.gz" ../data/processed/gwis/
-
-
-
-
-for bm in hscrp_log aisi_log; do for exp in FISHbin LEGUMESbin NUTSbin fish_oil oily_fish nonoily_fish; do qsub -t 1-22 run_gwis.sh $bm $exp; done; done
-for bm in hscrp_log aisi_log; do for exp in FISHbin LEGUMESbin NUTSbin fish_oil oily_fish nonoily_fish; do qsub postprocess_gwis.sh ../data/processed/gwis/${bm}_${exp}_gwis; done; done
-for bm in hscrp_log aisi_log; do for exp in FISHbin LEGUMESbin NUTSbin fish_oil oily_fish nonoily_fish; do qsub run_magma.sh ../data/processed/gwis/${bm}_${exp}_gwis_magmaInput.tsv ${bm}_${exp}; done; done
-#for bm in hscrp_log aisi_log; do cat ../data/processed/meddiet_components.txt | while read exp; do qsub run_magma.sh ../data/processed/gwis/${bm}_${exp}_gwis_magmaInput.tsv ${bm}_${exp}; done; done
-for bm in hscrp_log aisi_log; do for exp in FISHbin LEGUMESbin NUTSbin; do qsub test_gw_gxe.sh $bm $exp; done; done
-
 
 
 # MAGMA
 qsub prep_ld_ref.sh
 qsub prep_magma.sh
-#for bm in hscrp_log hba1c; do qsub run_magma.sh ../data/processed/gwis/${bm}_MD_gwis_magmaInput.tsv ${bm}_MD; done
-#for bm in hscrp_log hba1c; do qsub run_magma.sh ../data/processed/gwis/${bm}_MDcomponents_gwis_magmaInput.tsv ${bm}_MDcomponents; done
 for bm in hscrp_log hba1c; do cat ../data/processed/meddiet_components.txt | while read exp; do qsub run_magma.sh ../data/processed/gwis/${bm}_${exp}_gwis_magmaInput.tsv ${bm}_${exp}; done; done
 
 rsync -avP uger:"florez_ukb_projects/gene-med-interactions/data/processed/magma/*.genes.out" ../data/processed/magma/
@@ -60,43 +46,7 @@ rsync -avP uger:"florez_ukb_projects/gene-med-interactions/data/processed/gw_gxe
 rsync -avP uger:"florez_ukb_projects/gene-med-interactions/data/processed/gw_gxe/*GxE_Var.txt" ../data/processed/gw_gxe/
 
 
-
-
 # Gene follow-up
-qsub gene_follow_up.sh 5 05:78407632-78428111 bhmt "hscrp_log hba1c" MDcomponents
-qsub gene_follow_up.sh 12 12:121416346-121440315 hnf1a "hscrp_log hba1c" MDcomponents
-qsub gene_follow_up.sh 12 12:121438289-121454290 c12orf43 "hscrp_log hba1c" MDcomponents
-
-qsub gene_follow_up.sh 8 08:145747772-145752417 lrrc24 "hscrp_log hba1c" MD
-qsub gene_follow_up.sh 17 17:78010441-78074412 ccdc40 "hscrp_log hba1c" MD
+qsub gene_follow_up.sh 8 08:145747772-145752417 lrrc24 "hscrp_log hba1c" mds
+qsub gene_follow_up.sh 17 17:78010441-78074412 ccdc40 "hscrp_log hba1c" mds
 qsub gene_follow_up.sh 1 01:226418850-226497468 lin9 "hscrp_log hba1c" NUTS
-qsub gene_follow_up.sh 4 04:90645250-90759455 snca "hscrp_log hba1c" REDPRMEAT
-qsub gene_follow_up.sh 19 19:16244838-16269386 hsh2d "hscrp_log hba1c" REDPRMEAT
-qsub gene_follow_up.sh 19 19:16222699-16245044 rab8a "hscrp_log hba1c" REDPRMEAT
-qsub gene_follow_up.sh 2 02:113825547-113833420 il1f10 "hscrp_log hba1c" MD
-
-qsub gene_follow_up.sh 12 12:121438289-121454290 c12orf43 "hscrp_log hba1c" MDcomponents
-qsub gene_follow_up.sh 12 12:121438289-121454290 c12orf43 "hscrp_log hba1c" MDcomponents
-qsub gene_follow_up.sh 12 12:121438289-121454290 c12orf43 "hscrp_log hba1c" MDcomponents
-
-for symbol in bhmt hnf1a c12orf43; do rsync -avP uger:"florez_ukb_projects/gene-med-interactions/data/processed/gwis/*${symbol}_subset" ../data/processed/gwis/; done
-for symbol in bhmt hnf1a c12orf43; do rsync -avP uger:"florez_ukb_projects/gene-med-interactions/data/processed/genotypes/${symbol}*.vcf.gz" ../data/processed/genotypes/; done
-
-
-
-
-#cut -f 2-8,11,14 ../data/processed/gwis/hscrp_log_MD_gwis_merged | gzip > ../data/processed/gwis/hscrp_log_MD_gwis_fumaInput.gz
-#cut -f 2-8,102 ../data/processed/gwis/hscrp_log_MDcomponents_gwis_merged | gzip > ../data/processed/gwis/hscrp_log_MDcomponents_gwis_fumaInput.gz
-
-# SLC-specific subsetting and analysis
-qsub subset_genotypes_slc.sh
-
-cat ../data/processed/biomarkers.txt | while read bm; do qsub run_ukb_gxd_slc.sh $bm; done
-
-rsync -ravP uger:florez_ukb_projects/gene-med-interactions/data/processed/ukb_gxe_res ../data/processed/
-
-# Export candidate rsID list from MedDiet and run sensitivity analyses
-rsync -avP ../data/processed/genotypes/followup_rsids.txt uger:florez_ukb_projects/gene-med-interactions/data/processed/genotypes/
-cat ../data/processed/biomarkers.txt | while read pheno; do cat ../data/processed/meddiet_components.txt | while read e; do qsub run_ukb_gxd_followup.sh $pheno $e; done; done
-rsync -avP uger:"florez_ukb_projects/gene-med-interactions/data/processed/ukb_gxe_res/*followup*" ../data/processed/ukb_gxe_res/
-rsync -ravP uger:florez_ukb_projects/gene-med-interactions/data/processed/ukb_gxe_res ../data/processed/
