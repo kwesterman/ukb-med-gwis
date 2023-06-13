@@ -1,0 +1,865 @@
+---
+output: html_document
+title: "UKB exploration of genome-wide GxMedDiet interactions"
+---
+
+Genome-wide interaction study model:
+
+$biomarker ~ G + MedDiet + G*MedDiet + age + sex + age*sex + 5 gPCs + 5 gPC*MedDiet$
+
+```{r setup, include=F}
+knitr::opts_chunk$set(echo=F, message=F,warning=F, dev="png", dpi=300,
+                      fig.path="../output/gwis_component_summary/",
+                      cache.path="../cache/gwis_component_summary/")
+suppressMessages(silent <- lapply(
+  c("knitr", "kableExtra", "data.table", "tidyverse", "patchwork"), 
+  library, character.only=T))
+```
+
+Here, we're using the genome-wide approach for two reasons:
+
+1. To establish the validity of the model (via Q-Q plots and genomic inflation).
+2. To prioritize candidate genes for more in-depth analysis, both in UKB (for example, using rare variants) and later in TOPMed.
+
+# Basic genome-wide summaries
+
+```{r model-data}
+biomarkers <- c("hscrp_log", "hba1c")
+models <- c("MD", "MDcomponents")
+mds_components <- scan("../data/processed/meddiet_components.txt", what=character())
+mds_components <- c("MD", mds_components)
+```
+
+```{r summary-functions}
+calc_lambda <- function(x, p=0.5){
+  # Calculate genomic inflation lambda value
+  x <- x[!is.na(x)]
+  x.quantile <- quantile(x, p)
+  round(qchisq(1 - x.quantile, 1) / qchisq(p, 1), 2)
+}
+
+
+make_qq <- function(data, pval_col, main=""){
+  # Make a quantile-quantile plot
+  data <- filter(data, data[[pval_col]] > 0)  # In case extremely low p-values are stored as zero
+
+  # Process p-values
+  y_vals <- sort(-log10(data[[pval_col]]))
+  x_vals <- -log10(rev(ppoints(length(y_vals))))  # ppoints generates a uniform probability distribution
+  lam <- calc_lambda(data[[pval_col]])
+
+  # Trim points at higher p-values (credit to RaMWAS package for code snippet)
+  levels = as.integer((x_vals - x_vals[1]) / (tail(x_vals, 1) - x_vals[1]) * 2000)
+  keep = c(TRUE, diff(levels) != 0)
+  levels = as.integer((y_vals - y_vals[1])/(tail(y_vals, 1) - y_vals[1]) * 2000)
+  keep = keep | c(TRUE, diff(levels) != 0)
+  keep = which(keep)
+
+  rm(data)  # Deal with memory issues
+    
+  tibble(x=x_vals[keep], y=y_vals[keep]) %>%
+    ggplot(aes(x=x, y=y)) + 
+    geom_point() +
+    geom_abline(slope=1, linetype="dashed") +
+    annotate("text", 
+#              label=bquote(lambda == .(lam)),  # NOTE: somehow this bquote call results in the warning about "is.na() applied to type language"
+             label=paste("lambda == ", lam), parse=TRUE,
+             x=-Inf, y=Inf, hjust=-0.5, vjust=3, size=5) +
+    labs(x=expression(-log[10](italic(p)) * " (Expected)"),
+         y=expression(-log[10](italic(p)) * " (Observed)"),
+         title=main) +
+    theme_bw() +
+    theme(panel.grid=element_blank())
+}
+
+make_manhattan <- function(data, pval_col, snp_col="SNP", chr_col="CHR", pos_col="POS", 
+                           threshold=5e-8, ylims=NULL, main="") {
+
+  mh_data <- data %>%
+    dplyr::rename(all_of(c(SNP=snp_col, CHR=chr_col, POS=pos_col, P=pval_col))) %>%
+    filter(!is.na(P)) %>%
+    mutate(P = as.numeric(P),
+           P = ifelse(P == 0, min(1e-300, min(P[P != 0], na.rm=T)), P),  # Remove P = 0
+           nlp = -log10(P))
+  
+  # Trim points in crowded regions (credit to RaMWAS package for code snippet)
+  yfac = as.integer(mh_data$nlp * 100) + 1L
+  yorder = sort.list(yfac)
+  yfac <- factor(yfac, levels=as.character(seq_len(max(yfac))))
+  ygroup <- split(seq_along(yfac), yfac)
+  for (i in seq_along(ygroup)) {
+    if (length(ygroup[[i]]) > 300) {
+      ygroup[[i]] <- sample(ygroup[[i]], size=300, replace=F)
+    }
+  }
+  keep <- unlist(ygroup, use.names=FALSE)
+  
+  mh_data <- mh_data %>%
+    select(SNP, CHR, POS, nlp) %>%
+    dplyr::slice(keep) %>%
+    mutate(POS = as.numeric(as.character(POS)),
+           CHR = factor(CHR, levels=c(1:22, "X"))) %>%
+    arrange(CHR, POS) %>%
+    mutate(pos_idx = seq(1, nrow(.)))
+  
+  suppressWarnings(chr_lengths <- sapply(c(1:22, "X"), function(chr) with(mh_data, max(POS[CHR == chr], na.rm=T))))
+  chr_lengths <- ifelse(is.infinite(chr_lengths), 0, chr_lengths)
+  chr_start_pos <- cumsum(chr_lengths) - chr_lengths
+  
+  mh_data <- mh_data %>%
+    mutate(x_coord = chr_start_pos[CHR] + POS,
+           color = CHR,
+    ) %>%
+    arrange(as.integer(color), nlp) #%>%
+#     distinct(SNP, .keep_all=T)
+  
+  lims <- mh_data %>%
+    group_by(CHR) %>%
+    summarise(avg_coord = (min(x_coord) + max(x_coord)) / 2)
+  
+  newcols <- setNames(
+    rep(x=c("#AAAAAA", "#8A8A8A"), length.out=23),  # Gray/dark gray for alternating chromosomes
+    levels(factor(lims$CHR))
+  )
+  
+  p1 <- ggplot() +
+    geom_point(data=mh_data, 
+               aes(x=x_coord, y=nlp, color=factor(color)), 
+               size=0.75, alpha=1) +
+    geom_hline(yintercept=-log10(threshold), linetype="dashed", color="black") + 
+    scale_x_continuous(breaks=lims$avg_coord[c(1:16, 18, 20, 20, 22, 23)], 
+                       labels=c(1:16, 18, 20, 20, 22, "X"), 
+                       expand=c(0,0)) +
+    scale_y_continuous(name=expression(-log[10](italic(p)))) +
+    scale_colour_manual(values=newcols, guide="none") +
+    scale_fill_manual(name="Color", values=newcols) +
+    labs(title=main) +
+    theme(axis.title.x=element_blank(),
+          axis.text.x=element_text(vjust = -1.5),
+          panel.grid.minor=element_blank(),
+          panel.grid.major.x=element_blank())
+  if (!is.null(ylims)) p1 <- p1 + coord_cartesian(ylim=ylims)
+  
+  p1
+}
+```
+
+## Variant-level
+
+```{r load-variant-sumstats}
+read_nom_sumstats <- function(bm, model) {
+  fn <- paste0("../data/processed/gwis/", bm, "_", model, "_gwis_merged_nom")
+  read_tsv(fn) %>%
+    select(SNP, CHR, POS, EA, NEA, AF, P)
+}
+
+gwis_res_list <- lapply(setNames(biomarkers, biomarkers), function(bm) {
+  lapply(setNames(mds_components, mds_components), function(comp) {
+    read_nom_sumstats(bm, comp)
+  })
+})
+```
+
+```{r variant-summaries}
+for (bm in biomarkers) {
+  for (comp in mds_components) {
+    mh_plt <- make_manhattan(gwis_res_list[[bm]][[comp]], "P") +
+      labs(title=paste0(bm, " - ", comp))
+    print(mh_plt)
+  }
+}
+```
+
+## Gene-level
+
+Using the FUMA GWAS platform, MAGMA was run to generate gene-level interaction test p-values.
+
+```{r load-gene-sumstats-FUMA}
+read_gene_sumstats <- function(bm, comp) {
+  fn <- paste0("../data/processed/gwis/fuma/", bm, "_", model, "/magma.genes.out")
+  read_tsv(fn) %>%
+    select(ens_gene=GENE, gene=SYMBOL, z=ZSTAT, P) %>%
+    mutate(q = p.adjust(P, method="BH"))
+}
+
+gene_res_list <- lapply(setNames(biomarkers, biomarkers), function(bm) {
+  lapply(setNames(models, models), function(model) {
+    read_gene_sumstats(bm, model)
+  })
+})
+```
+
+```{r load-gene-sumstats}
+read_gene_sumstats <- function(bm, comp) {
+  fn <- paste0("../data/processed/magma/", bm, "_", comp, ".genes.out")
+  read_tsv(fn, col_types=cols()) %>%
+    select(ens_gene=GENE, gene=SYMBOL, z=ZSTAT, P) %>%
+    mutate(q = p.adjust(P, method="BH"))
+}
+
+gene_res_list <- lapply(setNames(biomarkers, biomarkers), function(bm) {
+  lapply(setNames(mds_components, mds_components), function(comp) {
+    read_gene_sumstats(bm, comp)
+  })
+})
+```
+
+```{r gene-summaries}
+for (bm in biomarkers) {
+  for (comp in mds_components) {
+    qq_plt <- make_qq(gene_res_list[[bm]][[comp]], "P") + 
+      labs(title=paste0(bm, " - ", comp))
+    print(qq_plt)
+  }
+}
+
+# for (bm in biomarkers) {
+#   for (model in models) {
+#     print(make_manhattan(gene_res_list[[bm]][[model]], "P"))
+#   }
+# }
+
+for (bm in biomarkers) {
+  for (comp in mds_components) {
+    print(head(arrange(gene_res_list[[bm]][[comp]], P)))
+  }
+}
+```
+
+```{r overall-gene-results}
+all_gene_res <- lapply(gene_res_list, bind_rows, .id="comp") %>%
+  bind_rows(.id="bm") %>%
+  arrange(P) %>%
+  mutate(q_all = p.adjust(P, method="BH"))
+```
+
+## Read in auxiliary data
+ 
+### Gene-level evidence
+
+* Main effect gene burden tests from ExPheWAS
+* GWS main effects from vQTL paper (w/ gene annotations)
+* GWS vQTL effects from vQTL paper (w/ gene annotations)
+
+```{r exphewas}
+bm_exphewas_name_map <- c(
+  hba1c="Glycated haemoglobin (HbA1c)", glu="Glucose", apoB="Apolipoprotein B", 
+  ldl="LDL direct", chol="Cholesterol", hdl="HDL cholesterol",
+  tg_log="Triglycerides", hscrp_log="C-reactive protein", 
+  alt_log="Alanine aminotransferase", vitD="Vitamin D"
+)
+
+exphewas_df <- lapply(bm_exphewas_name_map, function(bm) {
+  fn <- grep(bm, list.files("../data/raw/exphewas/", full.names=TRUE), value=TRUE)
+  read_csv(fn)
+}) %>%
+  setNames(names(bm_exphewas_name_map)) %>%
+  bind_rows(.id="biomarker")  %>%
+  mutate(sig_exphewas = `Q-Value` < 0.05) %>%
+  select(biomarker, gene=Symbol, sig_exphewas, `Q-Value`)
+
+
+slc_variant_anno <- read_tsv("../data/processed/slc_gene_variant_list.tsv") %>%
+  select(rsid=`Variant name`, gene=`Gene name`, consequence=`Variant consequence`)
+
+slc_exphewas_df <- exphewas_df %>%
+  filter(gene %in% slc_variant_anno$gene)
+```
+
+```{r vqtl-data}
+bm_vqtl_name_map <- c(
+  hba1c="hba1c_log", glu="glu_log", apoB="apoB_statinadj_log", 
+  ldl="ldl_statinadj_log", chol="chol_statinadj_log", hdl="hdl_log",
+  tg_log="tg_log", hscrp_log="hscrp_log", 
+  alt_log="alt_log"#, vitD="vitD"
+)
+
+vqtl_study_df <- lapply(bm_vqtl_name_map, function(bm) {
+  vf_colnames <- c("type", "gene", "CHR", "POS", "end", "a1", "a2", "rsID", "P")
+  me_vf_df <- read_tsv(paste0("../data/processed/prior_evidence/", bm, "_me.variant_function"),
+                       col_names=vf_colnames)
+  vqtl_vf_df <- read_tsv(paste0("../data/processed/prior_evidence/", bm, "_vqtl.variant_function"),
+                         col_names=vf_colnames)
+  vf_df <- bind_rows(list(me=me_vf_df, vqtl=vqtl_vf_df), .id="type") %>%
+    filter(P < 5e-8) %>%
+    select(type, CHR, POS, gene) %>%
+    mutate(CHR = as.character(CHR)) %>% 
+    separate_rows(gene, sep=",") %>% 
+    mutate(gene_dist = gsub("dist=", "", str_extract(gene, "dist=[0-9]*")),
+           gene_dist = as.numeric(gene_dist),
+           gene = gsub("\\(.*", "", gene)) %>%
+    # group_by(CHR, POS) %>%
+    # arrange(gene_dist) %>%
+    # dplyr::slice(1) %>%
+    # ungroup() %>%
+    # select(CHR, POS, gene)
+    # filter(grepl("^SLC", gene)) %>%
+    distinct(type, gene) %>%
+    mutate(value=TRUE) %>%
+    pivot_wider(names_from="type", names_prefix="sig_",
+                values_from="value", values_fill=FALSE)
+}) %>%
+  bind_rows(.id="biomarker")
+```
+
+```{r gene-evidence, fig.width=5}
+gene_evidence_df <- exphewas_df %>%
+  full_join(vqtl_study_df, by=c("gene", "biomarker")) %>%
+  mutate(across(contains("sig_"), ~ifelse(is.na(.), FALSE, .)))
+
+gene_evidence_df %>%
+  group_by(biomarker) %>%
+  summarise(across(contains("sig_"), sum)) %>%
+  kable()
+
+gene_annot_list <- lapply(setNames(biomarkers, biomarkers), function(bm) {
+  df <- filter(gene_evidence_df, biomarker == bm)
+  list(
+    ExPheWAS = df$gene[df$sig_exphewas],
+    ME = df$gene[df$sig_me],
+    vQTL = df$gene[df$sig_vqtl],
+    SLC = grep("^SLC", df$gene, value=TRUE),
+    ME_and_vQTL = df$gene[df$sig_me & df$sig_vqtl]
+  )
+})
+
+ggVennDiagram::ggVennDiagram(gene_annot_list$hscrp_log)
+ggVennDiagram::ggVennDiagram(gene_annot_list$hba1c)
+```
+
+```{r permutation-enrichment-tests}
+run_perm_test <- function(p_test, p_all, n_bg, random_seed=123) {
+  set.seed(random_seed)
+  chisq_test <- qchisq(p_test, df=1, lower.tail=FALSE)
+  chisq_test_sum <- sum(chisq_test)
+  chisq_all <- qchisq(p_all, df=1, lower.tail=FALSE)
+  chisq_bg_sums <- sapply(1:n_bg, function(i) {
+    sum(sample(chisq_all, length(chisq_test), replace=FALSE))
+  })
+  p_out <- sum(chisq_bg_sums > chisq_test_sum) / n_bg
+  p_out
+}
+```
+
+```{r gene-category-enrichments}
+gene_cat_enrich_df <- expand_grid(
+  biomarker = biomarkers,
+  comp = mds_components,
+  gene_set = names(gene_annot_list$hscrp_log)
+) %>%
+  mutate(perm_p = pmap_dbl(list(biomarker, comp, gene_set), function(b, m, g) {
+    df <- gene_res_list[[b]][[m]]
+    run_perm_test(filter(df, gene %in% gene_annot_list[[b]][[g]])$P, df$P, 1e3)
+  }))
+
+gene_cat_enrich_df %>% View()
+
+#   tibble(
+#   gene_category = c("SLC genes", "ExPheWAS main effects", "Main effects from Westerman 2022", "vQTLs from Westerman 2022"),
+#   `Enrichment P` = c(p_slc_enrich, p_exphewas_enrich, p_me_enrich, p_vqtl_enrich)
+# ) %>%
+#   kable(caption="Enrichment of gene-based GWIS signal in various gene categories")
+```
+
+```{r enrichments-tmp-hba1c}
+ggVennDiagram::ggVennDiagram(gene_annot_list$hba1c[c("ME", "vQTL")],
+                             label="count") +
+  theme(legend.position="none")
+
+gene_cat_enrich_df %>%
+  filter(biomarker == "hba1c",
+         model == "MDcomponents",
+         gene_set %in% c("ME", "vQTL", "ME_and_vQTL", "ExPheWAS")) %>%
+  select(`Gene set`=gene_set, `Permutation P-value`=perm_p)
+
+make_qq(filter(gene_res_list$hba1c$MD, 
+               gene %in% gene_annot_list$hba1c$ExPheWAS),
+        "P")
+
+filter(gene_res_list$hba1c$MDcomponents, 
+               gene %in% gene_annot_list$hba1c$ME_and_vQTL) %>%
+  arrange(P) %>%
+  mutate(q = p.adjust(P, method="BH")) %>%
+  head()
+```
+
+```{r enrichments-tmp-hscrp}
+ggVennDiagram::ggVennDiagram(gene_annot_list$hscrp_log[c("ME", "vQTL")],
+                             label="count") +
+  theme(legend.position="none")
+
+gene_cat_enrich_df %>%
+  filter(biomarker == "hscrp_log",
+         model == "MDcomponents",
+         gene_set %in% c("ME", "vQTL", "ME_and_vQTL")) %>%
+  select(`Gene set`=gene_set, `Permutation P-value`=perm_p)
+
+make_qq(filter(gene_res_list$hscrp_log$MDcomponents, 
+               gene %in% gene_annot_list$hscrp_log$ME),
+        "P")
+
+filter(gene_res_list$hscrp_log$MDcomponents, 
+               gene %in% gene_annot_list$hscrp_log$ME) %>%
+  arrange(P) %>%
+  mutate(q = p.adjust(P, method="BH")) %>%
+  head()
+```
+
+# Gene-specific follow-up
+
+```{r ilf10}
+ilf10_ss <- read_tsv("../data/processed/gwis/hscrp_log_MD_gwis_il1f10_subset")
+# for (dv in mds_components) {
+#   beta_col <- paste0("Beta_G-", dv)
+#   var_col <- paste0("Var_Beta_G-", dv)
+#   chisq_vals <- ilf10_ss[[beta_col]]^2 / ilf10_ss[[var_col]]
+#   ilf10_ss[[paste0("p_int_", dv)]] <- pchisq(chisq_vals, df=1, lower.tail=FALSE)
+# }
+
+ilf10_ss %>%
+  # select(POS, contains("p_int")) %>%
+  # pivot_longer(-POS, names_to="dv", names_prefix="p_int_", values_to="p_int") %>%
+  mutate(nlp_int = -log10(P_Value_Interaction)) %>%
+  ggplot(aes(x=POS, y=nlp_int, color=dv)) +
+  geom_point()
+```
+```{r il1f10-regressions}
+library(vcfR)
+a <- read.vcfR("../data/processed/genotypes/il1f10_genotypes_rs13019891.vcf.gz")
+
+gt_mat <- a@gt
+var_info <- a@fix
+
+phenos <- read_csv("../data/processed/ukb_phenos_unrelated.csv", col_types=cols(id="c"))
+rs13019891_vec <- gt_mat[which(var_info[, "ID"] == "rs13019891"), ]
+rs13019891_df <- tibble(id = names(rs13019891_vec)[-1], rs13019891 = rs13019891_vec[-1]) %>%
+  mutate(rs13019891 =  as.numeric(gsub(".*:", "", rs13019891)))
+phenos <- left_join(phenos, rs13019891_df, by="id")
+
+covars <- c("age", "sex", "ageBysex", 
+            paste0("gPC", 1:5), 
+            paste0("med_scoreBygPC", 1:5))
+lm_str <- paste0("hscrp_log ~ rs13019891 * med_score + ", paste(covars, collapse=" + "))
+lm_fit <- lm(as.formula(lm_str), data=phenos)
+broom::tidy(lm_fit)
+
+lm_str <- paste0("hscrp_log ~ rs13019891 * REDPRMEAT + ", paste(covars, collapse=" + "))
+lm_fit <- lm(as.formula(lm_str), data=phenos)
+broom::tidy(lm_fit)
+
+lm_str <- paste0("hscrp_log ~ rs13019891 * med_score + ", paste(covars, collapse=" + "))
+lm_fit <- lm(as.formula(lm_str), data=phenos %>% filter(num_recalls > 1))
+broom::tidy(lm_fit)
+
+lm_str <- paste0("hscrp_log ~ rs13019891 * REDPRMEAT + ", paste(covars, collapse=" + "))
+lm_fit <- lm(as.formula(lm_str), data=phenos %>% filter(num_recalls > 2))
+broom::tidy(lm_fit)
+```
+
+
+
+
+
+
+```{r ccdc40}
+ccdc40_ss <- read_tsv("../data/processed/gwis/hba1c_MD_gwis_ccdc40_subset")
+# for (dv in mds_components) {
+#   beta_col <- paste0("Beta_G-", dv)
+#   var_col <- paste0("Var_Beta_G-", dv)
+#   chisq_vals <- ccdc40_ss[[beta_col]]^2 / ccdc40_ss[[var_col]]
+#   ccdc40_ss[[paste0("p_int_", dv)]] <- pchisq(chisq_vals, df=1, lower.tail=FALSE)
+# }
+
+ccdc40_ss %>%
+  # select(POS, contains("p_int")) %>%
+  # pivot_longer(-POS, names_to="dv", names_prefix="p_int_", values_to="p_int") %>%
+  mutate(nlp_int = -log10(P_Value_Interaction)) %>%
+  ggplot(aes(x=POS, y=nlp_int, color=dv)) +
+  geom_point()
+
+ccdc40_ss %>% arrange(P_Value_Interaction) %>% head()
+```
+```{r ccdc40-regressions}
+library(vcfR)
+a <- read.vcfR("../data/processed/genotypes/ccdc40_genotypes_rs111597290.vcf.gz")
+
+gt_mat <- a@gt
+var_info <- a@fix
+
+phenos <- read_csv("../data/processed/ukb_phenos_unrelated.csv", col_types=cols(id="c"))
+rs111597290_vec <- gt_mat[which(var_info[, "ID"] == "rs111597290"), ]
+rs111597290_df <- tibble(id = names(rs111597290_vec)[-1], rs111597290 = rs111597290_vec[-1]) %>%
+  mutate(rs111597290 =  as.numeric(gsub(".*:", "", rs111597290)))
+phenos <- left_join(phenos, rs111597290_df, by="id")
+
+covars <- c("age", "sex", "ageBysex", 
+            paste0("gPC", 1:5), 
+            paste0("med_scoreBygPC", 1:5))
+lm_str <- paste0("hba1c ~ rs111597290 * med_score + ", paste(covars, collapse=" + "))
+lm_fit <- lm(as.formula(lm_str), data=phenos)
+broom::tidy(lm_fit)
+
+lm_str <- paste0("hba1c ~ rs111597290 * FISH + ", paste(covars, collapse=" + "))
+lm_fit <- lm(as.formula(lm_str), data=phenos)
+broom::tidy(lm_fit)
+
+lm_str <- paste0("hba1c ~ rs111597290 * oily_fish + ", paste(covars, collapse=" + "))
+lm_fit <- lm(as.formula(lm_str), data=phenos)
+broom::tidy(lm_fit)
+
+lm_str <- paste0("hba1c ~ rs111597290 * nonoily_fish + ", paste(covars, collapse=" + "))
+lm_fit <- lm(as.formula(lm_str), data=phenos)
+broom::tidy(lm_fit)
+
+lm_str <- paste0("hba1c ~ rs111597290 * fish_oil + ", paste(covars, collapse=" + "))
+lm_fit <- lm(as.formula(lm_str), data=phenos)
+broom::tidy(lm_fit)
+
+lm_str <- paste0("hba1c ~ rs111597290 * med_score + ", paste(covars, collapse=" + "))
+lm_fit <- lm(as.formula(lm_str), data=phenos %>% filter(num_recalls > 1))
+broom::tidy(lm_fit)
+
+lm_str <- paste0("hba1c ~ rs111597290 * FISH + ", paste(covars, collapse=" + "))
+lm_fit <- lm(as.formula(lm_str), data=phenos %>% filter(num_recalls > 2))
+broom::tidy(lm_fit)
+```
+
+
+
+
+```{r lin9}
+lin9_ss <- read_tsv("../data/processed/gwis/hba1c_NUTS_gwis_lin9_subset")
+# for (dv in mds_components) {
+#   beta_col <- paste0("Beta_G-", dv)
+#   var_col <- paste0("Var_Beta_G-", dv)
+#   chisq_vals <- lin9_ss[[beta_col]]^2 / lin9_ss[[var_col]]
+#   lin9_ss[[paste0("p_int_", dv)]] <- pchisq(chisq_vals, df=1, lower.tail=FALSE)
+# }
+
+lin9_ss %>%
+  # select(POS, contains("p_int")) %>%
+  # pivot_longer(-POS, names_to="dv", names_prefix="p_int_", values_to="p_int") %>%
+  mutate(nlp_int = -log10(P_Value_Interaction)) %>%
+  ggplot(aes(x=POS, y=nlp_int, color=dv)) +
+  geom_point()
+
+lin9_ss %>% arrange(P_Value_Interaction) %>% head()
+```
+
+```{r lin9-regressions}
+library(vcfR)
+a <- read.vcfR("../data/processed/genotypes/lin9_genotypes_rs9729447.vcf.gz")
+
+gt_mat <- a@gt
+var_info <- a@fix
+
+phenos <- read_csv("../data/processed/ukb_phenos_unrelated.csv", col_types=cols(id="c"))
+rs9729447_vec <- gt_mat[which(var_info[, "ID"] == "rs9729447"), ]
+rs9729447_df <- tibble(id = names(rs9729447_vec)[-1], rs9729447 = rs9729447_vec[-1]) %>%
+  mutate(rs9729447 =  as.numeric(gsub(".*:", "", rs9729447)))
+phenos <- left_join(phenos, rs9729447_df, by="id")
+
+covars <- c("age", "sex", "ageBysex", 
+            paste0("gPC", 1:5), 
+            paste0("med_scoreBygPC", 1:5))
+lm_str <- paste0("hba1c ~ rs9729447 * med_score + ", paste(covars, collapse=" + "))
+lm_fit <- lm(as.formula(lm_str), data=phenos)
+broom::tidy(lm_fit)
+
+lm_str <- paste0("hba1c ~ rs9729447 * NUTS + ", paste(covars, collapse=" + "))
+lm_fit <- lm(as.formula(lm_str), data=phenos)
+broom::tidy(lm_fit)
+
+lm_str <- paste0("hba1c ~ rs9729447 * NUTS + ", paste(covars, collapse=" + "))
+lm_fit <- lm(as.formula(lm_str), data=phenos %>% filter(num_recalls > 2))
+broom::tidy(lm_fit)
+```
+
+
+
+
+
+```{r bhmt-sumstats}
+bhmt_ss <- read_tsv("../data/processed/gwis/hscrp_log_MDcomponents_gwis_bhmt_subset")
+for (dv in mds_components) {
+  beta_col <- paste0("Beta_G-", dv)
+  var_col <- paste0("Var_Beta_G-", dv)
+  chisq_vals <- bhmt_ss[[beta_col]]^2 / bhmt_ss[[var_col]]
+  bhmt_ss[[paste0("p_int_", dv)]] <- pchisq(chisq_vals, df=1, lower.tail=FALSE)
+}
+
+bhmt_ss %>%
+  select(POS, contains("p_int")) %>%
+  pivot_longer(-POS, names_to="dv", names_prefix="p_int_", values_to="p_int") %>%
+  mutate(nlp_int = -log10(p_int)) %>% View()
+  ggplot(aes(x=POS, y=nlp_int, color=dv)) +
+  geom_point() +
+  scale_color_discrete(name="MDS component") +
+  labs(y=expression(Exposure-specific-log[10](p)))
+```
+
+```{r bhmt-regressions}
+# library(vcfR)
+# a <- read.vcfR("../data/processed/genotypes/bhmt_genotypes.vcf.gz")
+
+gt_mat <- a@gt
+var_info <- a@fix
+
+phenos <- read_csv("../data/processed/ukb_phenos_unrelated.csv", col_types=cols(id="c"))
+rs622087_vec <- gt_mat[which(var_info[, "ID"] == "rs622087"), ]
+rs622087_df <- tibble(id = names(rs622087_vec)[-1], rs622087 = rs622087_vec[-1]) %>%
+  mutate(rs622087 =  as.numeric(gsub(".*:", "", rs622087)))
+phenos <- left_join(phenos, rs622087_df, by="id")
+
+covars <- c("age", "sex", "ageBysex", 
+            paste0("gPC", 1:5), 
+            paste0("med_scoreBygPC", 1:5))
+lm_str <- paste0("hscrp_log ~ rs622087 * FISH + ", paste(covars, collapse=" + "))
+lm_fit <- lm(as.formula(lm_str), data=phenos)
+broom::tidy(lm_fit)
+
+lm_str <- paste0("hscrp_log ~ rs622087 * oily_fish + ", paste(covars, collapse=" + "))
+lm_fit <- lm(as.formula(lm_str), data=phenos)
+broom::tidy(lm_fit)
+lm_str <- paste0("hscrp_log ~ rs622087 * nonoily_fish + ", paste(covars, collapse=" + "))
+lm_fit <- lm(as.formula(lm_str), data=phenos)
+broom::tidy(lm_fit)
+
+lm_str <- paste0("hscrp_log ~ rs622087 * fish_oil + ", paste(covars, collapse=" + "))
+lm_fit <- lm(as.formula(lm_str), data=phenos)
+broom::tidy(lm_fit)
+
+phenos %>%
+  filter(!is.na(FISH), !is.na(hscrp_log)) %>%
+  mutate(fish_tert = cut(FISH, c(-1, 0, 1, 10), include.lowest=FALSE,
+                         labels=c("None", "<1 serving/day", ">=1 serving/day")),
+         rs622087_int = factor(round(rs622087), labels=c("TT", "GT", "GG"))) %>%
+  group_by(fish_tert, rs622087_int) %>%
+  summarise(m = mean(hscrp_log),
+            se = sd(hscrp_log) / sqrt(n()),
+            l95 = m - 1.96 * se,
+            u95 = m + 1.96 * se) %>%
+  ggplot(aes(x=rs622087_int, y=m, color=fish_tert)) +
+  geom_point(position=position_dodge(width=0.2)) +
+  geom_errorbar(aes(ymin=l95, ymax=u95), position=position_dodge(width=0.2),
+                width=0.2) +
+  scale_color_discrete(name="Fish intake (24HR)") +
+  labs(x="rs622087",
+       y="Mean log(hsCRP) w/ 95% CI")
+
+phenos %>%
+  filter(!is.na(oily_fish), !is.na(hscrp_log)) %>%
+  mutate(fish_tert = cut(oily_fish, c(-1, 0, 0.2, 10), include.lowest=FALSE,
+                         labels=c("None", "<=1 serving/wk", ">1 serving/wk")),
+         rs622087_int = factor(round(rs622087), labels=c("TT", "GT", "GG"))) %>%
+  group_by(fish_tert, rs622087_int) %>%
+  summarise(m = mean(hscrp_log),
+            se = sd(hscrp_log) / sqrt(n()),
+            l95 = m - 1.96 * se,
+            u95 = m + 1.96 * se) %>%
+  ggplot(aes(x=rs622087_int, y=m, color=fish_tert)) +
+  geom_point(position=position_dodge(width=0.2)) +
+  geom_errorbar(aes(ymin=l95, ymax=u95), position=position_dodge(width=0.2),
+                width=0.2) +
+  scale_color_discrete(name="Oily fish intake (FFQ)") +
+  labs(x="rs622087",
+       y="Mean log(hsCRP) w/ 95% CI")
+
+phenos %>%
+  filter(!is.na(nonoily_fish), !is.na(hscrp_log)) %>%
+  mutate(fish_tert = cut(nonoily_fish, c(-1, 0, 0.2, 10), include.lowest=FALSE,
+                         labels=c("None", "<=1 serving/wk", ">1 serving/wk")),
+         rs622087_int = factor(round(rs622087), labels=c("TT", "GT", "GG"))) %>%
+  group_by(fish_tert, rs622087_int) %>%
+  summarise(m = mean(hscrp_log),
+            se = sd(hscrp_log) / sqrt(n()),
+            l95 = m - 1.96 * se,
+            u95 = m + 1.96 * se) %>%
+  ggplot(aes(x=rs622087_int, y=m, color=fish_tert)) +
+  geom_point(position=position_dodge(width=0.2)) +
+  geom_errorbar(aes(ymin=l95, ymax=u95), position=position_dodge(width=0.2),
+                width=0.2) +
+  scale_color_discrete(name="Non-oily fish intake (FFQ)") +
+  labs(x="rs622087",
+       y="Mean log(hsCRP) w/ 95% CI")
+
+phenos %>%
+  filter(!is.na(fish_oil), !is.na(hscrp_log)) %>%
+  mutate(fish_tert = cut(fish_oil, c(-1, 0, 1), include.lowest=FALSE,
+                         labels=c("No", "Yes")),
+         rs622087_int = factor(round(rs622087), labels=c("TT", "GT", "GG"))) %>%
+  group_by(fish_tert, rs622087_int) %>%
+  summarise(m = mean(hscrp_log),
+            se = sd(hscrp_log) / sqrt(n()),
+            l95 = m - 1.96 * se,
+            u95 = m + 1.96 * se) %>%
+  ggplot(aes(x=rs622087_int, y=m, color=fish_tert)) +
+  geom_point(position=position_dodge(width=0.2)) +
+  geom_errorbar(aes(ymin=l95, ymax=u95), position=position_dodge(width=0.2),
+                width=0.2) +
+  scale_color_discrete(name="Fish oil intake (24HR)") +
+  labs(x="rs622087",
+       y="Mean log(hsCRP) w/ 95% CI")
+```
+
+```{r hnf1a}
+hnf1a_ss <- read_tsv("../data/processed/gwis/hscrp_log_MDcomponents_gwis_hnf1a_subset")
+for (dv in mds_components) {
+  beta_col <- paste0("Beta_G-", dv)
+  var_col <- paste0("Var_Beta_G-", dv)
+  chisq_vals <- hnf1a_ss[[beta_col]]^2 / hnf1a_ss[[var_col]]
+  hnf1a_ss[[paste0("p_int_", dv)]] <- pchisq(chisq_vals, df=1, lower.tail=FALSE)
+}
+
+hnf1a_ss %>%
+  select(POS, contains("p_int")) %>%
+  pivot_longer(-POS, names_to="dv", names_prefix="p_int_", values_to="p_int") %>%
+  mutate(nlp_int = -log10(p_int)) %>%
+  ggplot(aes(x=POS, y=nlp_int, color=dv)) +
+  geom_point()
+```
+
+```{r mapk3}
+mapk3_ss <- read_tsv("../data/processed/gwis/hscrp_log_MDcomponents_gwis_mapk3_subset")
+for (dv in mds_components) {
+  beta_col <- paste0("Beta_G-", dv)
+  var_col <- paste0("Var_Beta_G-", dv)
+  chisq_vals <- mapk3_ss[[beta_col]]^2 / mapk3_ss[[var_col]]
+  mapk3_ss[[paste0("p_int_", dv)]] <- pchisq(chisq_vals, df=1, lower.tail=FALSE)
+}
+
+mapk3_ss %>%
+  select(POS, contains("p_int")) %>%
+  pivot_longer(-POS, names_to="dv", names_prefix="p_int_", values_to="p_int") %>%
+  mutate(nlp_int = -log10(p_int)) %>%
+  ggplot(aes(x=POS, y=nlp_int, color=dv)) +
+  geom_point()
+```
+
+```{r read-vcf}
+library(vcfR)
+a <- read.vcfR("../data/processed/genotypes/mapk3_genotypes.vcf.gz")
+
+gt_mat <- a@gt
+gt_mat <- gsub(".*:", "", gt_mat)
+```
+
+
+
+```{r load-data, eval=F}
+read_bm_res <- function(bm) {
+  read_tsv(paste0("../data/processed/ukb_gxe_res/", bm, "_minimal_slc")) %>%
+    mutate(CHR = gsub("^0", "", CHR))
+}
+
+res_list <- lapply(setNames(biomarkers, biomarkers), function(bm) {
+  read_bm_res(bm)
+})
+combined_res <- bind_rows(res_list, .id="biomarker")
+```
+
+```{r primary-results, eval=F}
+primary_res <- combined_res %>%
+  left_join(variant_anno, by=c("RSID"="rsid")) %>%
+  left_join(gene_evidence_df, by=c("biomarker", "gene"))
+```
+
+```{r manhattans, eval=F}
+mh_data <- res_list$hba1c  %>%
+  select(SNP=RSID, CHR, POS, P=P_Value_Interaction) %>%
+  filter(!is.na(P)) %>%
+  mutate(CHR = as.integer(ifelse(CHR == "X", 23, CHR)),
+         P = ifelse(P == 0, min(1e-300, min(P[P != 0], na.rm=T)), P),  # Remove P = 0
+         nlp = -log10(P))
+
+# Trim points in crowded regions (credit to RaMWAS package for code snippet)
+yfac = as.integer(mh_data$nlp * 100) + 1L
+yorder = sort.list(yfac)
+yfac <- factor(yfac, levels=as.character(seq_len(max(yfac))))
+ygroup <- split(seq_along(yfac), yfac)
+for (i in seq_along(ygroup)) {
+  if (length(ygroup[[i]]) > 300) {
+    ygroup[[i]] <- sample(ygroup[[i]], size=300, replace=F)
+  }
+}
+keep <- unlist(ygroup, use.names=FALSE)
+
+mh_data <- mh_data %>%
+  select(SNP, CHR, POS, nlp) %>%
+  dplyr::slice(keep) %>%
+  mutate(POS = as.numeric(as.character(POS)),
+         CHR = factor(CHR, levels=1:22)) %>%
+  arrange(CHR, POS) %>%
+  mutate(pos_idx = seq(1, nrow(.)))
+
+chr_lengths <- sapply(1:23, function(chr) {
+  if (chr %in% mh_data$CHR) max(mh_data$POS[mh_data$CHR == chr]) else 1e8
+} )
+chr_start_pos <- cumsum(chr_lengths) - chr_lengths
+
+mh_data <- mh_data %>%
+  mutate(x_coord = chr_start_pos[CHR] + POS,
+         color = CHR,
+  ) %>%
+  arrange(as.integer(color), nlp)
+
+lims <- mh_data %>%
+  group_by(CHR) %>%
+  summarise(avg_coord = (min(x_coord) + max(x_coord)) / 2)
+
+mh_cols <- setNames(
+  rep(x=c("#999999", "#555555"), length.out=22),  # Gray/dark gray for alternating chromosomes
+  levels(factor(lims$CHR))
+)
+
+ggplot() +
+  geom_point(data=mh_data, 
+             aes(x=x_coord, y=nlp, color=factor(color)), 
+             size=0.6, alpha=1) +
+  # geom_hline(yintercept=-log10(bonferroni), linetype="dashed", color="black") + 
+  scale_x_continuous(breaks=lims$avg_coord[c(1:16, 18, 20, 20, 22)], 
+                     labels=c(1:16, 18, 20, 20, 22), 
+                     expand=c(0,0)) +
+  scale_colour_manual(values=mh_cols, guide="none") +
+  theme_minimal() +
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_text(vjust = -1.5),
+        panel.grid.minor=element_blank(),
+        panel.grid.major.x=element_blank()) +
+  labs("Example 'Manhattan' plot for HbA1c (analysis was not genome-wide)")
+```
+
+```{r pruning, eval=F}
+prune_chromosome <- function(chr_df, pval_col, locus_width) {
+  # Prune variants given a chromosome-specific summary statistic data frame
+  df <- arrange(chr_df, !!sym(pval_col))  # Sort by ascending p-value
+  pruned_df <- tibble()
+  while(nrow(df) > 0) {
+    pruned_df <- bind_rows(pruned_df, df[1, ])  # Add lowest p-value to pruned dataset
+    df <- filter(df, (POS < df$POS[1] - locus_width / 2) |  # Remove rest of variants in that distance-based locus
+                   (POS > df$POS[1] + locus_width / 2))
+  }
+  pruned_df
+}
+
+prune_variants <- function(ss_df, pval_col, thresh=5e-8, locus_width=1000000) {
+  # Prune variants across all chromosomes using a simple distance-based approach
+  if (min(ss_df[[pval_col]], na.rm=T) > thresh) return(tibble())
+  ss_df %>%
+    filter(!!sym(pval_col) < thresh) %>%
+    mutate(POS = as.numeric(POS)) %>%
+    nest(data=-CHR) %>%
+    mutate(pruned_ss=map(data, prune_chromosome, pval_col, locus_width)) %>%
+    unnest(pruned_ss) %>%
+    select(-data) %>%
+    dplyr::rename(index_var=SNP)
+}
+
+# pruned_res <- primary_res %>%
+#   select(biomarker, gene, SNP=RSID, CHR, POS, gene, P_Value_Interaction) %>%
+#   nest(-biomarker) %>%
+#   mutate(pruned_bm_res = map(data, prune_variants, "P_Value_Interaction", thresh=0.05)) %>%
+#   select(-data) %>%
+#   unnest(pruned_bm_res)
+```
+

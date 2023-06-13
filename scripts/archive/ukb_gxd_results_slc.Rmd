@@ -1,0 +1,363 @@
+---
+output: html_document
+title: "UKB exploration of GxMedDiet interactions for SLC genes"
+---
+
+The SLC genes (~400 in the human genome) code for a variety of cellular transport functions in the body, with relevance to metabolism, nutrients, and drugs. The NIH Nutrition Science Roadmap specifically called out these genes as ripe for exploration to better understand their roles in mediating as well as modifying the impact of dietary factors on human health. Here, we are exploring interactions between higher-impact SNPs in these genes (coding or splicing variation) and dietary factors (starting with a Mediterranean diet pattern) in affecting cardiometabolic risk factors in UK Biobank participants.
+
+Outcomes of interest stem from the set of cardiometabolic risk factors that have been associated with Mediterranean diet adherence. Specifically, as collected and reviewed by Ros and colleagues (Ros et al. 2014, *Adv Nutr*), the PREDIMED study showed significant improvements in the following risk factors: blood pressure (esp. diastolic), plasma glucose, cholesterol:HDL-C ratio, and C-reactive protein.
+
+Dataset:
+* UK Biobank unrelated subset: N ~ 137,000
+* Dietary data: 24-hour diet history questionnaire (between 1 and 5 completed per person)
+* Outcomes are cardiometabolic blood biomarkers
+
+```{r setup, include=F}
+knitr::opts_chunk$set(echo=F, message=F,warning=F, dev="png", dpi=300,
+                      fig.path="../output/ukb_gxd_results_slc/",
+                      cache.path="../cache/ukb_gxd_results_slc/")
+suppressMessages(silent <- lapply(
+  c("knitr", "kableExtra", "data.table", "tidyverse", "patchwork"), 
+  library, character.only=T))
+```
+
+```{r biomarkers}
+biomarkers <- c(
+  "hba1c", "glu", "apoB", "ldl", "chol", "hdl", "tg_log", "hscrp_log", "alt_log", "vitD"
+)
+biomarkers_pretty <- c(
+  "HbA1c", "RG", "ApoB", "LDL-C", "TC", "HDL-C", "TG", "hsCRP",  "ALT", "Vitamin D"
+)
+```
+
+```{r load-data}
+read_bm_res <- function(bm) {
+  read_tsv(paste0("../data/processed/ukb_gxe_res/", bm, "_minimal_slc")) %>%
+    mutate(CHR = gsub("^0", "", CHR))
+}
+
+res_list <- lapply(setNames(biomarkers, biomarkers), function(bm) {
+  read_bm_res(bm)
+})
+combined_res <- bind_rows(res_list, .id="biomarker")
+```
+
+## Read in auxiliary data
+
+### Variant annotations
+
+From BioMart/Ensembl
+
+```{r variant-annotations}
+variant_anno <- read_tsv("../data/processed/slc_gene_variant_list.tsv") %>%
+  select(rsid=`Variant name`, gene=`Gene name`, consequence=`Variant consequence`)
+```
+ 
+### Gene-level evidence
+
+* Main effect gene burden tests from ExPheWAS
+* GWS main effects from vQTL paper (w/ gene annotations)
+* GWS vQTL effects from vQTL paper (w/ gene annotations)
+
+```{r exphewas}
+bm_exphewas_name_map <- c(
+  hba1c="Glycated haemoglobin (HbA1c)", glu="Glucose", apoB="Apolipoprotein B", 
+  ldl="LDL direct", chol="Cholesterol", hdl="HDL cholesterol",
+  tg_log="Triglycerides", hscrp_log="C-reactive protein", 
+  alt_log="Alanine aminotransferase", vitD="Vitamin D"
+)
+
+slc_exphewas_df <- lapply(bm_exphewas_name_map, function(bm) {
+  fn <- grep(bm, list.files("../data/raw/exphewas/", full.names=TRUE), value=TRUE)
+  read_csv(fn)
+}) %>%
+  setNames(names(bm_exphewas_name_map)) %>%
+  bind_rows(.id="biomarker") %>%
+  filter(Symbol %in% variant_anno$gene)
+
+slc_exphewas_df <- slc_exphewas_df %>%
+  mutate(sig_exphewas = `Q-Value` < 0.05) %>%
+  select(biomarker, gene=Symbol, sig_exphewas)
+```
+
+```{r vqtl-data}
+bm_vqtl_name_map <- c(
+  hba1c="hba1c_log", glu="glu_log", apoB="apoB_statinadj_log", 
+  ldl="ldl_statinadj_log", chol="chol_statinadj_log", hdl="hdl_log",
+  tg_log="tg_log", hscrp_log="hscrp_log", 
+  alt_log="alt_log"#, vitD="vitD"
+)
+
+slc_vqtl_study_df <- lapply(bm_vqtl_name_map, function(bm) {
+  vf_colnames <- c("type", "gene", "CHR", "POS", "end", "a1", "a2", "rsID", "P")
+  me_vf_df <- read_tsv(paste0("../data/processed/prior_evidence/", bm, "_me.variant_function"),
+                       col_names=vf_colnames)
+  vqtl_vf_df <- read_tsv(paste0("../data/processed/prior_evidence/", bm, "_vqtl.variant_function"),
+                         col_names=vf_colnames)
+  vf_df <- bind_rows(list(me=me_vf_df, vqtl=vqtl_vf_df), .id="type") %>%
+    filter(P < 5e-8) %>%
+    select(type, CHR, POS, gene) %>%
+    mutate(CHR = as.character(CHR)) %>% 
+    separate_rows(gene, sep=",") %>% 
+    mutate(gene_dist = gsub("dist=", "", str_extract(gene, "dist=[0-9]*")),
+           gene_dist = as.numeric(gene_dist),
+           gene = gsub("\\(.*", "", gene)) %>%
+    # group_by(CHR, POS) %>%
+    # arrange(gene_dist) %>%
+    # dplyr::slice(1) %>%
+    # ungroup() %>%
+    # select(CHR, POS, gene)
+    filter(grepl("^SLC", gene)) %>%
+    distinct(type, gene) %>%
+    mutate(value=TRUE) %>%
+    pivot_wider(names_from="type", names_prefix="sig_",
+                values_from="value", values_fill=FALSE)
+}) %>%
+  bind_rows(.id="biomarker")
+```
+
+```{r gene-evidence}
+gene_evidence_df <- slc_exphewas_df %>%
+  full_join(slc_vqtl_study_df, by=c("gene", "biomarker")) %>%
+  mutate(across(contains("sig_"), ~ifelse(is.na(.), FALSE, .)))
+
+gene_evidence_df %>%
+  group_by(biomarker) %>%
+  summarise(across(contains("sig_"), sum)) %>%
+  kable()
+```
+
+Could include a Venn Diagram here to show gene-level support from different prior evidence sources.
+
+```{r vqtl-effects, eval=F}
+bm_vqtl_name_map <- c(
+  hba1c="hba1c_log", glu="glu_log", apoB="apoB_statinadj_log", 
+  ldl="ldl_statinadj_log", chol="chol_statinadj_log", hdl="hdl_log",
+  tg_log="tg_log", hscrp_log="hscrp_log", 
+  alt_log="alt_log"
+)
+
+vqtl_gene_annots <- readRDS("../data/raw/westerman_2022/gene_annots.rds") %>%
+  filter(grepl("^SLC", gene))
+
+vqtl_top_res_df <- lapply(bm_vqtl_name_map, function(bm) {
+  read_csv(paste0("../data/raw/westerman_2022/", bm, "_vqtl_metaanalysis_p0.01.csv"))
+}) %>%
+  setNames(names(bm_vqtl_name_map)) %>%
+  bind_rows(.id="biomarker") %>%
+  mutate(CHR = as.character(CHR)) %>%
+  inner_join(vqtl_gene_annots, by=c("CHR", "POS"))
+
+slc_sig_vqtl_df <- vqtl_top_res_df %>%
+  select(biomarker, gene, vqtl_p=P)
+```
+
+```{r primary-results}
+primary_res <- combined_res %>%
+  left_join(variant_anno, by=c("RSID"="rsid")) %>%
+  left_join(gene_evidence_df, by=c("biomarker", "gene"))
+```
+
+# Visualization of results
+
+```{r manhattans}
+mh_data <- res_list$hba1c  %>%
+  select(SNP=RSID, CHR, POS, P=P_Value_Interaction) %>%
+  filter(!is.na(P)) %>%
+  mutate(CHR = as.integer(ifelse(CHR == "X", 23, CHR)),
+         P = ifelse(P == 0, min(1e-300, min(P[P != 0], na.rm=T)), P),  # Remove P = 0
+         nlp = -log10(P))
+
+# Trim points in crowded regions (credit to RaMWAS package for code snippet)
+yfac = as.integer(mh_data$nlp * 100) + 1L
+yorder = sort.list(yfac)
+yfac <- factor(yfac, levels=as.character(seq_len(max(yfac))))
+ygroup <- split(seq_along(yfac), yfac)
+for (i in seq_along(ygroup)) {
+  if (length(ygroup[[i]]) > 300) {
+    ygroup[[i]] <- sample(ygroup[[i]], size=300, replace=F)
+  }
+}
+keep <- unlist(ygroup, use.names=FALSE)
+
+mh_data <- mh_data %>%
+  select(SNP, CHR, POS, nlp) %>%
+  dplyr::slice(keep) %>%
+  mutate(POS = as.numeric(as.character(POS)),
+         CHR = factor(CHR, levels=1:22)) %>%
+  arrange(CHR, POS) %>%
+  mutate(pos_idx = seq(1, nrow(.)))
+
+chr_lengths <- sapply(1:23, function(chr) {
+  if (chr %in% mh_data$CHR) max(mh_data$POS[mh_data$CHR == chr]) else 1e8
+} )
+chr_start_pos <- cumsum(chr_lengths) - chr_lengths
+
+mh_data <- mh_data %>%
+  mutate(x_coord = chr_start_pos[CHR] + POS,
+         color = CHR,
+  ) %>%
+  arrange(as.integer(color), nlp)
+
+lims <- mh_data %>%
+  group_by(CHR) %>%
+  summarise(avg_coord = (min(x_coord) + max(x_coord)) / 2)
+
+mh_cols <- setNames(
+  rep(x=c("#999999", "#555555"), length.out=22),  # Gray/dark gray for alternating chromosomes
+  levels(factor(lims$CHR))
+)
+
+ggplot() +
+  geom_point(data=mh_data, 
+             aes(x=x_coord, y=nlp, color=factor(color)), 
+             size=0.6, alpha=1) +
+  # geom_hline(yintercept=-log10(bonferroni), linetype="dashed", color="black") + 
+  scale_x_continuous(breaks=lims$avg_coord[c(1:16, 18, 20, 20, 22)], 
+                     labels=c(1:16, 18, 20, 20, 22), 
+                     expand=c(0,0)) +
+  scale_colour_manual(values=mh_cols, guide=F) +
+  theme_minimal() +
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_text(vjust = -1.5),
+        panel.grid.minor=element_blank(),
+        panel.grid.major.x=element_blank()) +
+  labs("Example 'Manhattan' plot for HbA1c (analysis was not genome-wide)")
+```
+
+```{r pruning}
+prune_chromosome <- function(chr_df, pval_col, locus_width) {
+  # Prune variants given a chromosome-specific summary statistic data frame
+  df <- arrange(chr_df, !!sym(pval_col))  # Sort by ascending p-value
+  pruned_df <- tibble()
+  while(nrow(df) > 0) {
+    pruned_df <- bind_rows(pruned_df, df[1, ])  # Add lowest p-value to pruned dataset
+    df <- filter(df, (POS < df$POS[1] - locus_width / 2) |  # Remove rest of variants in that distance-based locus
+                   (POS > df$POS[1] + locus_width / 2))
+  }
+  pruned_df
+}
+
+prune_variants <- function(ss_df, pval_col, thresh=5e-8, locus_width=1000000) {
+  # Prune variants across all chromosomes using a simple distance-based approach
+  if (min(ss_df[[pval_col]], na.rm=T) > thresh) return(tibble())
+  ss_df %>%
+    filter(!!sym(pval_col) < thresh) %>%
+    mutate(POS = as.numeric(POS)) %>%
+    nest(data=-CHR) %>%
+    mutate(pruned_ss=map(data, prune_chromosome, pval_col, locus_width)) %>%
+    unnest(pruned_ss) %>%
+    select(-data) %>%
+    dplyr::rename(index_var=SNP)
+}
+
+# pruned_res <- primary_res %>%
+#   select(biomarker, gene, SNP=RSID, CHR, POS, gene, P_Value_Interaction) %>%
+#   nest(-biomarker) %>%
+#   mutate(pruned_bm_res = map(data, prune_variants, "P_Value_Interaction", thresh=0.05)) %>%
+#   select(-data) %>%
+#   unnest(pruned_bm_res)
+
+pruned_res <- primary_res %>%
+  group_by(biomarker, gene) %>%
+  slice(which.min(P_Value_Interaction)) %>%
+  ungroup()
+```
+
+```{r summary-heatmap}
+# prioritized_res <- primary_res %>%  # This version grabs identical variants across biomarkers, rather than the top variant per gene/biomarker combo
+#   filter(RSID %in% pruned_res$index_var) %>%
+#   arrange(CHR, POS) %>%
+#   group_by(gene) %>%
+#   filter(any(P_Value_Interaction < 0.001)) %>%
+#   ungroup()
+
+prioritized_res <- pruned_res %>%
+  mutate(fdr_q = p.adjust(P_Value_Interaction, method="BH")) %>%
+  group_by(gene) %>%
+  filter(any(fdr_q < 0.2)) %>%
+  ungroup()
+
+prioritized_res <- pruned_res %>%
+  filter(sig_me | sig_vqtl) %>%
+  mutate(fdr_q = p.adjust(P_Value_Interaction, method="BH")) %>%
+  group_by(gene) %>%
+  filter(any(fdr_q < 0.1)) %>%
+  ungroup()
+
+prioritized_res %>%
+  mutate(RSID = factor(RSID, levels=unique(RSID)),
+         MAF = round(pmin(AF, 1 - AF), 3),
+         snp_label = paste0(RSID, "(", gene, ")"),
+         P_discrete = cut(P_Value_Interaction, c(1, 0.05, 0.01, 0.001, 0)),
+         # sig_star = case_when(
+         #   (P_Value_Interaction < bonferroni_tmp) & 
+         #     (burden_qval < 0.05) &
+         #     (!is.na(vqtl_p)) ~ "***",
+         #   (P_Value_Interaction < bonferroni_tmp) & 
+         #     (burden_qval < 0.05) ~ "**",
+         #   (P_Value_Interaction < bonferroni_tmp) ~ "*",
+         #   TRUE ~ ""
+         # )
+         sig_star = ifelse(fdr_q < 0.2, "*", "")) %>%
+  ggplot(aes(x=gene, y=biomarker)) +
+  geom_tile(aes(fill=P_discrete)) +
+  scale_fill_brewer(direction=-1) +
+  geom_text(aes(label=sig_star), size=5) +
+  theme(axis.text.x=element_text(angle=25, hjust=0.9))
+```
+
+### Followup with MedDiet components
+
+```{r export-prioritized-snps}
+write(c("rsid", unique(prioritized_res$RSID)), "../data/processed/genotypes/followup_rsids.txt")
+```
+
+```{r load-followup}
+md_components <- c("VEG", "LEGUMES", "FRUIT", "NUTS", "FISH", "WHGRAIN", 
+                   "MUFA2SFA", "REDPRMEAT", "ALC")
+
+read_fu <- function(bm, e) {
+  fn <- paste0("../data/processed/ukb_gxe_res/", bm, "_minimal_followup_exp_", e)
+  read_tsv(fn)
+}
+
+fu_res <- expand_grid(
+  biomarker = biomarkers,
+  exposure = md_components
+) %>%
+  rowwise() %>%
+  mutate(res = list(read_fu(biomarker, exposure))) %>%
+  unnest(res) %>%
+  left_join(select(prioritized_res, RSID, gene), by="RSID")
+
+fu_res_specific <- fu_res %>%  # Subset to specific SNP/biomarker combos
+  inner_join(select(prioritized_res, RSID, biomarker), by=c("RSID", "biomarker"))
+
+fu_res_specific %>%
+  bind_rows(mutate(prioritized_res, exposure = "MDS")) %>%
+  group_by(gene) %>%
+  mutate(css = qchisq(P_Value_Interaction, 1, lower.tail=FALSE),
+         star = ifelse(P_Value_Interaction < P_Value_Interaction[exposure == "MDS"], "*", "")) %>% View()
+  ggplot(aes(x=gene, y=exposure)) +
+  geom_tile(aes(fill=css)) +
+  # scale_fill_brewer(direction=-1) +
+  geom_text(aes(label=star), size=5) +
+  theme(axis.text.x=element_text(angle=25, hjust=0.9))
+```
+
+
+## Biomarker distributions (for reference)
+
+
+```{r biomarker-histograms, fig.asp=1, eval=F}
+phenos <- read_csv("../data/processed/vqtl_phenos_EUR.csv")
+
+hist_list <- lapply(setNames(biomarkers, biomarkers), function(bm) {
+  ggplot(phenos, aes_string(x=paste0(bm, "_adj"))) +
+    geom_histogram(bins=30) +
+    labs(x=biomarkers_pretty[which(biomarkers == bm)], y="")
+})
+
+do.call(plot_grid, c(hist_list, ncol=4))
+```

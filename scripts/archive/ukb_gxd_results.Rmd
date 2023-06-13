@@ -1,0 +1,177 @@
+---
+output: html_document
+title: "UKB replication of reported gene-MedDiet interactions"
+---
+
+Given a set of variants annotated to genes of potential interest (for now, those spatially within gene limits), each variant is tested for interaction with the Mediterranean Diet (from UK Biobank ancestry-pooled dataset)
+
+Dataset:
+* UK Biobank unrelated subset: N ~ ???
+* 
+
+```{r setup, include=F}
+knitr::opts_chunk$set(echo=F, message=F,warning=F, dev="png", dpi=300,
+                      fig.path="../output/ukb_gxd_results/",
+                      cache.path="../cache/ukb_gxd_results/")
+suppressMessages(silent <- lapply(
+  c("knitr", "kableExtra", "data.table", "tidyverse", "patchwork"), 
+  library, character.only=T))
+```
+
+```{r biomarkers}
+biomarkers <- c(
+  "hba1c", "glu", "apoB", "ldl", "chol", "hdl", "tg_log", "hscrp_log", "alt_log", "vitD"
+)
+biomarkers_pretty <- c(
+  "HbA1c", "RG", "ApoB", "LDL-C", "TC", "HDL-C", "TG", "hsCRP",  "ALT", "Vitamin D"
+)
+```
+
+```{r load-data}
+read_bm_res <- function(bm) {
+  read_tsv(paste0("../data/processed/ukb_gxe_res/", bm, "_minimal")) %>%
+    mutate(CHR = gsub("^0", "", CHR))
+}
+
+res_list <- lapply(setNames(biomarkers, biomarkers), function(bm) {
+  read_bm_res(bm)
+})
+combined_res <- bind_rows(res_list, .id="biomarker")
+```
+
+```{r variant-annotations}
+variant_anno <- read_tsv("../data/processed/target_gene_variant_list.tsv") %>%
+  select(rsid=`Variant name`, gene=`Gene name`, consequence=`Variant consequence`)
+```
+
+```{r manhattans}
+mh_data <- res_list$hba1c  %>%
+  select(SNP=RSID, CHR, POS, P=P_Value_Interaction) %>%
+  filter(!is.na(P)) %>%
+  mutate(CHR = as.integer(ifelse(CHR == "X", 23, CHR)),
+         P = ifelse(P == 0, min(1e-300, min(P[P != 0], na.rm=T)), P),  # Remove P = 0
+         nlp = -log10(P))
+
+# Trim points in crowded regions (credit to RaMWAS package for code snippet)
+yfac = as.integer(mh_data$nlp * 100) + 1L
+yorder = sort.list(yfac)
+yfac <- factor(yfac, levels=as.character(seq_len(max(yfac))))
+ygroup <- split(seq_along(yfac), yfac)
+for (i in seq_along(ygroup)) {
+  if (length(ygroup[[i]]) > 300) {
+    ygroup[[i]] <- sample(ygroup[[i]], size=300, replace=F)
+  }
+}
+keep <- unlist(ygroup, use.names=FALSE)
+
+mh_data <- mh_data %>%
+  select(SNP, CHR, POS, nlp) %>%
+  dplyr::slice(keep) %>%
+  mutate(POS = as.numeric(as.character(POS)),
+         CHR = factor(CHR, levels=1:22)) %>%
+  arrange(CHR, POS) %>%
+  mutate(pos_idx = seq(1, nrow(.)))
+
+chr_lengths <- sapply(1:23, function(chr) {
+  if (chr %in% mh_data$CHR) max(mh_data$POS[mh_data$CHR == chr]) else 1e8
+} )
+chr_start_pos <- cumsum(chr_lengths) - chr_lengths
+
+mh_data <- mh_data %>%
+  mutate(x_coord = chr_start_pos[CHR] + POS,
+         color = CHR,
+  ) %>%
+  arrange(as.integer(color), nlp)
+
+lims <- mh_data %>%
+  group_by(CHR) %>%
+  summarise(avg_coord = (min(x_coord) + max(x_coord)) / 2)
+
+mh_cols <- setNames(
+  rep(x=c("#999999", "#555555"), length.out=22),  # Gray/dark gray for alternating chromosomes
+  levels(factor(lims$CHR))
+)
+
+ggplot() +
+  geom_point(data=mh_data, 
+             aes(x=x_coord, y=nlp, color=factor(color)), 
+             size=0.6, alpha=1) +
+  # geom_hline(yintercept=-log10(bonferroni), linetype="dashed", color="black") + 
+  scale_x_continuous(breaks=lims$avg_coord[c(1:16, 18, 20, 20, 22)], 
+                     labels=c(1:16, 18, 20, 20, 22), 
+                     expand=c(0,0)) +
+  scale_colour_manual(values=mh_cols, guide=F) +
+  theme_minimal() +
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_text(vjust = -1.5),
+        panel.grid.minor=element_blank(),
+        panel.grid.major.x=element_blank())
+```
+
+```{r pruning}
+prune_chromosome <- function(chr_df, pval_col, locus_width) {
+  # Prune variants given a chromosome-specific summary statistic data frame
+  df <- arrange(chr_df, !!sym(pval_col))  # Sort by ascending p-value
+  pruned_df <- tibble()
+  while(nrow(df) > 0) {
+    pruned_df <- bind_rows(pruned_df, df[1, ])  # Add lowest p-value to pruned dataset
+    df <- filter(df, (POS < df$POS[1] - locus_width / 2) |  # Remove rest of variants in that distance-based locus
+                   (POS > df$POS[1] + locus_width / 2))
+  }
+  pruned_df
+}
+
+prune_variants <- function(ss_df, pval_col, thresh=5e-8, locus_width=1000000) {
+  # Prune variants across all chromosomes using a simple distance-based approach
+  if (min(ss_df[[pval_col]], na.rm=T) > thresh) return(tibble())
+  ss_df %>%
+    filter(!!sym(pval_col) < thresh) %>%
+    mutate(POS = as.numeric(POS)) %>%
+    nest(data=-CHR) %>%
+    mutate(pruned_ss=map(data, prune_chromosome, pval_col, locus_width)) %>%
+    unnest(pruned_ss) %>%
+    select(-data) %>%
+    dplyr::rename(index_var=SNP)
+}
+
+pruned_res <- res_combined %>%
+  select(SNP=RSID, CHR, POS, P_Value_Interaction) %>%
+  prune_variants("P_Value_Interaction", thresh=0.05)
+```
+
+```{r summary-heatmap}
+bonferroni_tmp <- 0.05 / 8 / 15
+
+prioritized_res <- combined_res %>%
+  filter(RSID %in% pruned_res$index_var) %>%
+  arrange(CHR, POS) %>%
+  inner_join(variant_anno, by=c("RSID"="rsid"))
+
+prioritized_res %>%
+  mutate(RSID = factor(RSID, levels=unique(RSID)),
+         MAF = round(pmin(AF, 1 - AF), 3),
+         snp_label = paste0(RSID, "(", gene, ")"),
+         P_discrete = cut(P_Value_Interaction, c(1, 0.05, 0.01, 0.001, 0)),
+         sig_star = ifelse(P_Value_Interaction < bonferroni_tmp, "*", "")) %>%
+  ggplot(aes(x=snp_label, y=biomarker)) +
+  geom_tile(aes(fill=P_discrete)) +
+  scale_fill_brewer(direction=-1) +
+  geom_text(aes(label=sig_star), size=5) +
+  theme(axis.text.x=element_text(angle=25, hjust=0.9))
+```
+
+
+## Biomarker distributions (for reference)
+
+
+```{r biomarker-histograms, fig.asp=1, eval=F}
+phenos <- read_csv("../data/processed/vqtl_phenos_EUR.csv")
+
+hist_list <- lapply(setNames(biomarkers, biomarkers), function(bm) {
+  ggplot(phenos, aes_string(x=paste0(bm, "_adj"))) +
+    geom_histogram(bins=30) +
+    labs(x=biomarkers_pretty[which(biomarkers == bm)], y="")
+})
+
+do.call(plot_grid, c(hist_list, ncol=4))
+```
